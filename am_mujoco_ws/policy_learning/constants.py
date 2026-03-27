@@ -2,7 +2,7 @@ import pathlib
 import numpy as np
 
 ### Task parameters
-DATA_DIR = '/home/harsh/flyingumi/data/bc/'
+DATA_DIR = '/local/real/jgoler/UMI-on-Air/data/bc/'
 TYPE = 'ee'
 STATE_DIM = 14
 ACTION_DIM = 8
