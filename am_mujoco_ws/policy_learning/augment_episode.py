@@ -90,10 +90,9 @@ def augment_qpos(qpos, grasp_t, delta_pos, delta_rot, grip_delta=0.0,
         a = alphas[t]
         if a == 0.0:
             continue
-        pos_new, quat_new = apply_se3(
-            slerp_fn(a), a * delta_pos,
-            qpos[t, 0:3], qpos[t, 3:7])
+        pos_new  = qpos[t, 0:3] + a * delta_pos
         pos_new[2] = max(pos_new[2], z_floor)
+        quat_new = scipy_to_quat_wxyz(slerp_fn(a) * quat_wxyz_to_scipy(qpos[t, 3:7]))
         aug[t, 0:3] = pos_new
         aug[t, 3:7] = quat_new
         aug[t, 7]   = np.clip(qpos[t, 7] + a * grip_delta, 0.0, 1.0)
