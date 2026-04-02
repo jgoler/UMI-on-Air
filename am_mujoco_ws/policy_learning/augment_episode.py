@@ -25,14 +25,15 @@ import cv2
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from scipy.spatial.transform import Rotation, Slerp
+from scipy.spatial.transform import Rotation
+from scipy.linalg import logm, expm
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from constants import SIM_TASK_CONFIGS, DT
+from constants import DT
 from ee_sim_env import make_ee_sim_env
 
 
-# ── SE(3) helpers ─────────────────────────────────────────────────────────────
+# ── SE(3) / Lie algebra helpers ───────────────────────────────────────────────
 
 def quat_wxyz_to_scipy(q):
     """[qw,qx,qy,qz] → scipy Rotation."""
@@ -43,11 +44,28 @@ def scipy_to_quat_wxyz(r):
     xyzw = r.as_quat()
     return np.array([xyzw[3], xyzw[0], xyzw[1], xyzw[2]])
 
-def apply_se3(R_delta, t_delta, pos, quat_wxyz):
-    """Apply SE(3) (R_delta, t_delta) to pose: p' = R@p + t, q' = R*q."""
-    pos_new  = R_delta.apply(pos) + t_delta
-    quat_new = scipy_to_quat_wxyz(R_delta * quat_wxyz_to_scipy(quat_wxyz))
-    return pos_new, quat_new
+def pose_to_se3(pos, quat_wxyz):
+    """Build 4x4 SE(3) matrix from position and [qw,qx,qy,qz] quaternion."""
+    T = np.eye(4)
+    T[:3, :3] = quat_wxyz_to_scipy(quat_wxyz).as_matrix()
+    T[:3,  3] = pos
+    return T
+
+def se3_to_pose(T):
+    """Extract (pos, quat_wxyz) from a 4x4 SE(3) matrix."""
+    pos      = T[:3, 3]
+    quat_wxyz = scipy_to_quat_wxyz(Rotation.from_matrix(T[:3, :3]))
+    return pos, quat_wxyz
+
+def interp_se3(T1, T2, alpha):
+    """Geodesic interpolation on SE(3) via Lie algebra (matrix log/exp).
+
+    At alpha=0 returns T1, at alpha=1 returns T2.
+    The path is a constant-speed screw motion — the geodesic on SE(3).
+    """
+    T_rel = np.linalg.inv(T1) @ T2   # relative transform from T1 to T2
+    xi    = logm(T_rel)               # se(3) element (4x4 skew-symmetric-like)
+    return T1 @ expm(alpha * xi)      # walk alpha fraction along the geodesic
 
 
 # ── Augmentation ──────────────────────────────────────────────────────────────
@@ -65,37 +83,55 @@ def augment_qpos(qpos, grasp_t, delta_pos, delta_rot, grip_delta=0.0,
     """
     Return (aug_qpos, recovery_t).
 
-    Perturbation is fully applied at start_t, then linearly decays to identity
-    by recovery_t (defaults to grasp_t - recovery_buffer). Stays at identity
-    after recovery_t, leaving the grasp/place phases unchanged.
-
-    grip_delta: signed offset added to the gripper openness during the
-                perturbed phase (decays with alpha, clipped to [0, 1]).
+    Geodesically interpolates (via SE(3) Lie algebra) from the perturbed pose
+    at start_t to the original pose at recovery_t, giving a smooth screw-motion
+    recovery path. After recovery_t the trajectory is identical to the original.
     """
     T = len(qpos)
     if recovery_t is None:
         recovery_t = max(start_t, grasp_t - recovery_buffer)
 
-    alphas = np.zeros(T)
-    if recovery_t > start_t:
-        alphas[start_t:recovery_t] = np.linspace(1.0, 0.0, recovery_t - start_t)
+    # Perturbed start pose
+    start_pos  = qpos[start_t, 0:3] + delta_pos
+    start_quat = scipy_to_quat_wxyz(delta_rot * quat_wxyz_to_scipy(qpos[start_t, 3:7]))
+    start_grip = np.clip(qpos[start_t, 7] + grip_delta, 0.0, 1.0)
 
-    slerp_fn = Slerp([0.0, 1.0],
-                     Rotation.concatenate([Rotation.identity(), delta_rot]))
+    # Recovery target: original pose at recovery_t
+    end_pos  = qpos[recovery_t, 0:3]
+    end_quat = qpos[recovery_t, 3:7]
+    end_grip = qpos[recovery_t, 7]
 
-    z_floor = qpos[:, 2].min()  # never push the EE below its lowest demo point
+    # SE(3) matrices for Lie algebra interpolation
+    T_start  = pose_to_se3(start_pos, start_quat)
+    T_end    = pose_to_se3(end_pos,   end_quat)
+
+    z_floor  = qpos[:, 2].min()
+    duration = recovery_t - start_t
+
+    # Speed-normalised alpha: progress along the geodesic at the same rate
+    # the original demo moved, so the policy sees natural EE velocities.
+    orig_speeds  = np.linalg.norm(
+        np.diff(qpos[start_t:recovery_t + 1, 0:3], axis=0), axis=1)  # (duration,)
+    cum_speeds   = np.concatenate([[0.0], np.cumsum(orig_speeds)])
+    total_speed  = cum_speeds[-1]
+    if total_speed > 0:
+        alphas = cum_speeds[:-1] / total_speed   # (duration,), 0→<1
+    else:
+        alphas = np.linspace(0.0, 1.0, duration, endpoint=False)
 
     aug = qpos.copy()
-    for t in range(T):
-        a = alphas[t]
-        if a == 0.0:
-            continue
-        pos_new  = qpos[t, 0:3] + a * delta_pos
-        pos_new[2] = max(pos_new[2], z_floor)
-        quat_new = scipy_to_quat_wxyz(slerp_fn(a) * quat_wxyz_to_scipy(qpos[t, 3:7]))
+    for i, t in enumerate(range(start_t, recovery_t)):
+        alpha = alphas[i]
+
+        T_t               = interp_se3(T_start, T_end, alpha)
+        pos_new, quat_new = se3_to_pose(T_t)
+        pos_new[2]        = max(pos_new[2], z_floor)
+        grip_new          = (1 - alpha) * start_grip + alpha * end_grip
+
         aug[t, 0:3] = pos_new
         aug[t, 3:7] = quat_new
-        aug[t, 7]   = np.clip(qpos[t, 7] + a * grip_delta, 0.0, 1.0)
+        aug[t, 7]   = grip_new
+
     return aug, recovery_t
 
 

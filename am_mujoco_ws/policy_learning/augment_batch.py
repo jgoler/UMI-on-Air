@@ -186,30 +186,45 @@ def make_grid_video(orig_images, all_observations, labels, perturbation_info,
 
 # ── 3-D trajectory plot ───────────────────────────────────────────────────────
 
+def _quat_wxyz_to_rot(q):
+    from scipy.spatial.transform import Rotation as R
+    return R.from_quat([q[1], q[2], q[3], q[0]])
+
+def _draw_arrows(ax, xyz, quats, alpha=1.0, arrow_len=0.03, step=1):
+    """Draw all three EE frame axes (X=red, Y=green, Z=blue) at every `step` timesteps."""
+    axes_colors = [(1,0,0), (0,0.7,0), (0,0,1)]  # X, Y, Z
+    axes_vecs   = [[1,0,0], [0,1,0], [0,0,1]]
+    for i in range(0, len(xyz), step):
+        rot = _quat_wxyz_to_rot(quats[i])
+        for vec, ac in zip(axes_vecs, axes_colors):
+            direction = rot.apply(vec)
+            ax.quiver(*xyz[i], *(direction * arrow_len),
+                      color=ac, alpha=alpha, linewidth=0.8, arrow_length_ratio=0.3)
+
+
 def make_3d_plot(qpos, all_aug_qpos, variants, grasp_t, out_path):
     """
-    3-D scatter/line plot showing the original trajectory and all augmented
-    variants in XYZ EE space.
-
-    For each augmented variant:
-      - perturbed segment  [start_t : recovery_t]  → coloured line
-      - recovery segment   [recovery_t : grasp_t]  → same colour, dashed
-      - perturb start point → large dot
-      - recovery point     → small marker where it rejoins original
-
-    Original trajectory is shown in black, with the grasp point marked.
+    3-D plot: original trajectory (black) + recovery paths for each augmented
+    variant [start_t → recovery_t].
+    Arrows show all three EE frame axes (X=red, Y=green, Z=blue).
     """
-    fig = plt.figure(figsize=(14, 10))
+    fig = plt.figure(figsize=(16, 11))
     ax  = fig.add_subplot(111, projection='3d')
 
-    orig_xyz = qpos[:, 0:3]
+    orig_xyz  = qpos[:, 0:3]
+    orig_quat = qpos[:, 3:7]
 
     # Original trajectory
     ax.plot(orig_xyz[:, 0], orig_xyz[:, 1], orig_xyz[:, 2],
             color='black', lw=2, zorder=5, label='original')
-    ax.scatter(*orig_xyz[0],      color='black', s=60, marker='s', zorder=6)
-    ax.scatter(*orig_xyz[grasp_t], color='green', s=80, marker='*', zorder=6,
+    ax.scatter(*orig_xyz[0],       color='black', s=60, marker='s', zorder=6)
+    ax.scatter(*orig_xyz[grasp_t], color='green', s=300, marker='*', zorder=6,
                label=f'grasp (t={grasp_t})')
+
+    # Orientation arrows along original
+    orig_step = max(1, grasp_t // 20)
+    _draw_arrows(ax, orig_xyz[:grasp_t], orig_quat[:grasp_t],
+                 alpha=0.3, step=orig_step)
 
     cmap = plt.get_cmap('tab20')
     n    = len(variants)
@@ -219,38 +234,31 @@ def make_3d_plot(qpos, all_aug_qpos, variants, grasp_t, out_path):
 
         color = cmap(idx / max(n - 1, 1))
         xyz   = aug_qpos[:, 0:3]
+        quat  = aug_qpos[:, 3:7]
+        s, r  = start_t, recovery_t
 
-        # Indices relative to full-length aug_qpos (same length as qpos)
-        s, r, g = start_t, recovery_t, grasp_t
+        # Recovery path
+        ax.plot(xyz[s:r, 0], xyz[s:r, 1], xyz[s:r, 2],
+                color=color, lw=1.5, alpha=0.9)
 
-        # Perturbed phase: start_t → recovery_t
-        if r > s:
-            ax.plot(xyz[s:r, 0], xyz[s:r, 1], xyz[s:r, 2],
-                    color=color, lw=1.5, alpha=0.9)
+        # Orientation arrows
+        seg_step = max(1, (r - s) // 6)
+        _draw_arrows(ax, xyz[s:r], quat[s:r], alpha=0.8, step=seg_step)
 
-        # Recovery phase: recovery_t → grasp_t (dashed, lighter)
-        if g > r:
-            ax.plot(xyz[r:g, 0], xyz[r:g, 1], xyz[r:g, 2],
-                    color=color, lw=1.0, ls='--', alpha=0.6)
-
-        # Start dot (perturbed position)
+        # Start dot + label
         ax.scatter(*xyz[s], color=color, s=50, marker='o', zorder=7)
-
-        # Recovery dot
-        ax.scatter(*xyz[r], color=color, s=20, marker='^', zorder=7)
-
-        # Label only the start dot
         ax.text(xyz[s, 0], xyz[s, 1], xyz[s, 2], f' {label}',
                 fontsize=6, color=color, va='bottom')
+
+        # Recovery point
+        ax.scatter(*xyz[r], color=color, s=80, marker='*', zorder=7)
 
     ax.set_xlabel('X (m)')
     ax.set_ylabel('Y (m)')
     ax.set_zlabel('Z (m)')
-    ax.set_title('EE trajectories: original (black) + augmented variants\n'
-                 'Solid = perturbed phase  |  Dashed = recovery phase  |  '
-                 'Circle = perturb start  |  Triangle = recovery point')
-
-    # Compact legend: only original + grasp marker
+    ax.set_title('EE trajectories: original (black) + augmented recovery paths\n'
+                 'Arrows = EE frame axes (R/G/B = X/Y/Z)  |  '
+                 'Circle = perturb start  |  Star = recovery point')
     ax.legend(loc='upper left', fontsize=8)
 
     fig.tight_layout()
@@ -267,6 +275,10 @@ def main():
         '/local/real/jgoler/UMI-on-Air/data/bc/umi_pick/demonstration/episode_2.hdf5')
     parser.add_argument('--out_dir', default=
         '/local/real/jgoler/UMI-on-Air/data/bc/umi_pick/augmented/batch')
+    parser.add_argument('--n_aug', type=int, default=15,
+                        help='Number of augmented trajectories to generate')
+    parser.add_argument('--aug_idx', type=int, default=None,
+                        help='If set, only run this single variant index from the full 15')
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -282,7 +294,11 @@ def main():
     grasp_t = detect_grasp_time(qpos)
     print(f"  T={len(qpos)}, grasp_t={grasp_t} ({grasp_t*DT:.1f}s)")
 
-    variants = build_perturbations(grasp_t)
+    all_variants = build_perturbations(grasp_t, n=max(args.n_aug, (args.aug_idx or 0) + 1))
+    if args.aug_idx is not None:
+        variants = [all_variants[args.aug_idx]]
+    else:
+        variants = all_variants[:args.n_aug]
     print(f"  Generating {len(variants)} augmented trajectories ...\n")
 
     all_observations  = []
